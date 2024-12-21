@@ -33,7 +33,7 @@ function M.setup(opts)
 			M.active = true
 
 			if not M.active_timer:is_active() then
-				M.active_timer:start(0, 60 * 1000, function()
+				M.active_timer:start(0, 30 * 1000, function()
 					M.handle_timer()
 				end)
 			end
@@ -46,7 +46,7 @@ function M.setup(opts)
 		group = M.autogroup_id,
 		callback = function()
 			M.active = false
-			M.active_timer:start(30 * 1000, 0, function()
+			M.active_timer:start(20 * 1000, 0, function()
 				M.handle_timer()
 			end)
 		end,
@@ -73,7 +73,6 @@ function M.trigger_heartbeat()
 		if basename == nil then
 			basename = "unknown"
 		end
-		vim.notify("heartbeat")
 		M.socket:write(vim.bo.filetype .. "\30" .. basename .. "\n", function(err)
 			if not err == nil then
 				vim.schedule(function()
@@ -85,9 +84,6 @@ function M.trigger_heartbeat()
 end
 
 function M.trigger_exit()
-	vim.schedule(function()
-		vim.notify("heartbeat")
-	end)
 	M.socket:write("\n", function(err)
 		if not err == nil then
 			vim.schedule(function()
@@ -97,4 +93,4 @@ function M.trigger_exit()
 	end)
 end
 
-M.setup({})
+return M
