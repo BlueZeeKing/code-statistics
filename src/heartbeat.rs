@@ -8,7 +8,10 @@ use smol::{
     LocalExecutor, Timer,
 };
 
-pub async fn start_heartbeat(executor: &LocalExecutor<'_>) -> Option<DateTime<Utc>> {
+pub async fn start_heartbeat(
+    executor: &LocalExecutor<'_>,
+    interval: Duration,
+) -> Option<DateTime<Utc>> {
     let mut file_path = data_dir().expect("Failed to get data directory");
     file_path.push("code-statistics");
     file_path.push("heartbeat");
@@ -37,7 +40,7 @@ pub async fn start_heartbeat(executor: &LocalExecutor<'_>) -> Option<DateTime<Ut
                 file.write_all(&Utc::now().timestamp().to_ne_bytes())
                     .await
                     .expect("Failed to write heartbeat");
-                Timer::after(Duration::from_secs(10)).await;
+                Timer::after(interval).await;
             }
         })
         .detach();

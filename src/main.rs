@@ -1,7 +1,17 @@
-use std::{rc::Rc, time::Duration};
+use core::panic;
+use std::{
+    os::fd::{FromRawFd, OwnedFd},
+    ptr,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
-use code_statistics::{heartbeat::start_heartbeat, log::Log, tags::Tags};
-use dirs::{data_dir, runtime_dir};
+use code_statistics::{
+    config::read_config, heartbeat::start_heartbeat, log::Log, sd_is_socket_unix, sd_listen_fds,
+    tags::Tags, SD_LISTEN_FDS_START,
+};
+use dirs::data_dir;
 use futures_concurrency::future::Race;
 use smol::{
     fs::create_dir_all,
@@ -9,10 +19,10 @@ use smol::{
     lock::Mutex,
     net::unix::UnixListener,
     stream::StreamExt,
-    Timer,
+    unblock, Timer,
 };
 
-fn main() {
+fn main() -> Result<(), ()> {
     let executor = smol::LocalExecutor::new();
 
     smol::block_on(executor.run(async {
@@ -21,12 +31,19 @@ fn main() {
             dir.push("code-statistics");
             dir
         };
-
         create_dir_all(&data_dir)
             .await
             .expect("Failed to create data directory");
 
-        let initial_heartbeat = start_heartbeat(&executor).await;
+        let config = Rc::new(read_config().await);
+        let timeout = Duration::from_secs_f64(config.timeout);
+
+        let initial_heartbeat = start_heartbeat(
+            &executor,
+            Duration::from_secs_f64(config.heartbeat_frequency),
+        )
+        .await;
+
         let log = Rc::new(Mutex::new(
             Log::new(
                 initial_heartbeat,
@@ -36,21 +53,33 @@ fn main() {
             .await,
         ));
 
-        let mut socket_path = runtime_dir().expect("Failed to get runtime directory");
-        socket_path.push("code-statistics");
-
-        let socket = UnixListener::bind(socket_path).expect("Failed to bind to ipc socket");
-
+        let fd = unblock(|| unsafe {
+            let num_descriptors = sd_listen_fds(1);
+            if num_descriptors <= 0 {
+                panic!("Failed to get sockets from systemd");
+            }
+            if sd_is_socket_unix(SD_LISTEN_FDS_START, 1, 1, ptr::null(), 0) != 1 {
+                panic!("Wrong kind of socket");
+            }
+            OwnedFd::from_raw_fd(SD_LISTEN_FDS_START)
+        })
+        .await;
+        let socket = UnixListener::try_from(fd).expect("Failed to bind to ipc socket");
         let mut listener = socket.incoming();
+
+        let count_active = Rc::new(AtomicU64::new(0));
 
         while let Some(stream) = listener.next().await {
             let stream = stream.expect("Failed to get next connection");
             let mut buffered_stream = BufReader::new(stream);
 
             let log = log.clone();
+            let count_active = count_active.clone();
+            let config = config.clone();
             executor
                 .spawn(async move {
                     let mut current_id = None;
+                    count_active.fetch_add(1, Ordering::Relaxed);
                     loop {
                         let Ok(line) = (
                             async {
@@ -70,7 +99,7 @@ fn main() {
                                 }
                             },
                             async {
-                                Timer::after(Duration::from_secs(60)).await;
+                                Timer::after(timeout).await;
                                 Ok(None)
                             },
                         )
@@ -92,12 +121,16 @@ fn main() {
                             let (language, project) =
                                 line.split_once(30u8 as char).unwrap_or((line, "unknown"));
 
-                            current_id =
-                                Some(log.lock().await.start_event(language, project).await);
+                            if !config.ignored_filetype.contains(language) {
+                                current_id =
+                                    Some(log.lock().await.start_event(language, project).await);
+                            }
                         }
                     }
                 })
                 .detach();
         }
     }));
+
+    Ok(())
 }
