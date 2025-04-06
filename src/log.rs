@@ -1,127 +1,150 @@
 use std::io::SeekFrom;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use dirs::data_dir;
+use futures_concurrency::future::Race;
 use smol::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt},
+    stream::StreamExt,
+    LocalExecutor, Timer,
 };
+use tracing::debug;
 
-use crate::tags::Tags;
+use crate::{channel, config::Config, debounce::debounce, Sender};
 
-pub struct Log {
-    file: File,
-    languages: Tags,
-    projects: Tags,
-    current_open: u128,
-    last_idxs: Option<(usize, usize)>,
+#[derive(Debug)]
+pub enum LogMessage {
+    Start {
+        id: u128,
+        time: DateTime<Utc>,
+        language: usize,
+        project: usize,
+    },
+    End {
+        id: u128,
+        time: DateTime<Utc>,
+    },
+    Heartbeat,
 }
 
-impl Log {
-    pub async fn new(
-        heartbeat_timestamp: Option<DateTime<Utc>>,
-        languages: Tags,
-        projects: Tags,
-    ) -> Self {
-        let mut file_path = data_dir().expect("Failed to find data directory");
-        file_path.push("code-statistics");
-        file_path.push("log");
+async fn send_start_event(
+    file: &mut File,
+    language_idx: usize,
+    project_idx: usize,
+    timestamp: DateTime<Utc>,
+) {
+    file.write_all(&[(language_idx + 1)
+        .try_into()
+        .expect("Cannot support more that 255 languages")])
+        .await
+        .expect("Failed to write to log file");
+    file.write_all(
+        &TryInto::<u16>::try_into(project_idx)
+            .expect("Cannot support more than 65536 projects")
+            .to_ne_bytes(),
+    )
+    .await
+    .expect("Failed to write to log file");
+    file.write_all(&timestamp.timestamp().to_ne_bytes())
+        .await
+        .expect("Failed to write to log file");
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .append(true)
-            .open(file_path)
-            .await
-            .expect("Failed to open log file");
-        if file.seek(SeekFrom::End(-9)).await.is_ok() {
-            let mut buf = [0; 9];
-            file.read_exact(&mut buf)
+    file.write_all(&[0])
+        .await
+        .expect("Failed to write to log file");
+    file.write_all(&timestamp.timestamp().to_ne_bytes())
+        .await
+        .expect("Failed to write to log file");
+}
+
+async fn send_stop_event(file: &mut File, timestamp: DateTime<Utc>) {
+    file.seek(SeekFrom::End(-(size_of::<i64>() as i64)))
+        .await
+        .expect("Failed to write to log file");
+    file.write_all(&timestamp.timestamp().to_ne_bytes())
+        .await
+        .expect("Failed to write to log file");
+}
+
+pub fn log(executor: &LocalExecutor<'_>, config: &'static Config) -> Sender<LogMessage, 5> {
+    let (sender, receiver) = channel();
+
+    let mut receiver = debounce(config.debounce_amount, receiver, executor);
+
+    executor
+        .spawn(async move {
+            let mut file_path = data_dir().expect("Failed to find data directory");
+            file_path.push("code-statistics");
+            file_path.push("log");
+
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .open(file_path)
                 .await
-                .expect("Failed to read old entry from log file");
+                .expect("Failed to open log file");
 
-            if buf[0] != 0 {
-                let last_timestamp = DateTime::from_timestamp(
-                    // This should always be the correct length so the cast will not fail
-                    i64::from_ne_bytes((&buf[1..]).try_into().unwrap()),
-                    0,
-                )
-                .expect("Timestamp from file is invalid")
-                    + TimeDelta::seconds(1);
+            file.seek(SeekFrom::End(0))
+                .await
+                .expect("Failed to write to log file");
 
-                let last_timestamp = if let Some(heartbeat_timestamp) = heartbeat_timestamp {
-                    last_timestamp.max(heartbeat_timestamp)
+            let mut current_id = None;
+            let mut last_message = None;
+
+            loop {
+                let message = if current_id.is_none() {
+                    receiver.next().await
                 } else {
-                    last_timestamp
+                    (receiver.next(), async {
+                        Timer::after(config.heartbeat_frequency).await;
+                        Some(LogMessage::Heartbeat)
+                    })
+                        .race()
+                        .await
                 };
 
-                file.write_all(&[0])
-                    .await
-                    .expect("Failed to write to log file");
-                file.write_all(&last_timestamp.timestamp().to_ne_bytes())
-                    .await
-                    .expect("Failed to write to log file");
+                let Some(message) = message else {
+                    break;
+                };
+
+                debug!(?message);
+
+                match message {
+                    LogMessage::Start {
+                        id,
+                        time,
+                        language,
+                        project,
+                    } => {
+                        if last_message
+                            .is_none_or(|last_message| last_message != (language, project))
+                        {
+                            send_start_event(&mut file, language, project, time).await;
+                        }
+                        current_id = Some(id);
+                        last_message = Some((language, project));
+                    }
+                    LogMessage::End { id, time } => {
+                        last_message = None;
+                        if current_id.is_some_and(|current_id| current_id == id) {
+                            send_stop_event(&mut file, time).await;
+                            current_id = None;
+                        }
+                    }
+                    LogMessage::Heartbeat => {
+                        if current_id.is_some() {
+                            send_stop_event(&mut file, Utc::now()).await;
+                            file.seek(SeekFrom::End(-(size_of::<i64>() as i64 + 1)))
+                                .await
+                                .expect("Failed to write to log file");
+                        }
+                    }
+                }
             }
-        }
+        })
+        .detach();
 
-        Self {
-            file,
-            languages,
-            projects,
-            current_open: 0,
-            last_idxs: None,
-        }
-    }
-
-    pub async fn start_event(&mut self, language: &str, project: &str) -> u128 {
-        let language_idx = self.languages.get(language).await + 1;
-        let project_idx = self.projects.get(project).await;
-
-        if !self
-            .last_idxs
-            .is_some_and(|(last_lang_idx, last_proj_idx)| {
-                last_lang_idx == language_idx && last_proj_idx == project_idx
-            })
-        {
-            self.file
-                .write_all(&[language_idx
-                    .try_into()
-                    .expect("Cannot support more that 255 languages")])
-                .await
-                .expect("Failed to write to log file");
-            self.file
-                .write_all(
-                    &TryInto::<u16>::try_into(project_idx)
-                        .expect("Cannot support more than 65536 projects")
-                        .to_ne_bytes(),
-                )
-                .await
-                .expect("Failed to write to log file");
-            self.file
-                .write_all(&Utc::now().timestamp().to_ne_bytes())
-                .await
-                .expect("Failed to write to log file");
-        }
-
-        self.last_idxs = Some((language_idx, project_idx));
-
-        self.current_open += 1;
-        self.current_open
-    }
-
-    pub async fn stop_event(&mut self, id: u128) {
-        if id == self.current_open {
-            self.file
-                .write_all(&[0])
-                .await
-                .expect("Failed to write to log file");
-            self.file
-                .write_all(&Utc::now().timestamp().to_ne_bytes())
-                .await
-                .expect("Failed to write to log file");
-
-            self.last_idxs = None;
-        }
-    }
+    sender
 }

@@ -1,21 +1,48 @@
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, path::Path, time::Duration};
 
 use dirs::config_dir;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use smol::fs::read_to_string;
 
-#[derive(Deserialize)]
-pub struct Config {
-    pub ignored_filetype: HashSet<String>,
-    pub timeout: f64,
-    pub heartbeat_frequency: f64,
+fn deserialize_seconds<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
+    f64::deserialize(de).map(Duration::from_secs_f64)
 }
 
-fn default_config() -> Config {
-    Config {
-        ignored_filetype: HashSet::new(),
-        timeout: 60.0,
-        heartbeat_frequency: 60.0,
+fn default_timeout() -> Duration {
+    Duration::from_secs(20)
+}
+
+fn default_heartbeat() -> Duration {
+    Duration::from_secs(20)
+}
+
+fn default_debounce() -> Duration {
+    Duration::from_secs(5)
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Config {
+    #[serde(default)]
+    pub ignored_languages: HashSet<String>,
+    #[serde(deserialize_with = "deserialize_seconds", default = "default_timeout")]
+    pub timeout: Duration,
+    #[serde(
+        deserialize_with = "deserialize_seconds",
+        default = "default_heartbeat"
+    )]
+    pub heartbeat_frequency: Duration,
+    #[serde(deserialize_with = "deserialize_seconds", default = "default_debounce")]
+    pub debounce_amount: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            ignored_languages: HashSet::new(),
+            timeout: default_timeout(),
+            heartbeat_frequency: default_heartbeat(),
+            debounce_amount: default_debounce(),
+        }
     }
 }
 
@@ -27,10 +54,10 @@ pub async fn read_config() -> Config {
     )
     .await
     else {
-        return default_config();
+        return Config::default();
     };
 
     toml::from_str(&config_file)
         .ok()
-        .unwrap_or_else(default_config)
+        .unwrap_or_else(Config::default)
 }

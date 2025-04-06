@@ -1,12 +1,16 @@
+use std::cell::RefCell;
+
 use dirs::data_dir;
 use smol::{
     fs::{File, OpenOptions},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    lock::Mutex,
 };
+use tracing::debug;
 
 pub struct Tags {
-    tags: Vec<String>,
-    file: File,
+    tags: RefCell<Vec<String>>,
+    file: Mutex<File>,
 }
 
 impl Tags {
@@ -34,32 +38,42 @@ impl Tags {
             .expect("Failed to read from tag file")
             != 0
         {
-            tags.push(std::mem::take(&mut line));
+            tags.push(std::mem::take(&mut line).trim().to_string());
         }
 
-        Self { tags, file }
+        debug!(?tags);
+
+        Self {
+            tags: RefCell::new(tags),
+            file: Mutex::new(file),
+        }
     }
 
-    pub async fn get(&mut self, language: &str) -> usize {
-        if let Some(pos) = self
-            .tags
-            .iter()
-            .position(|known_language| known_language == language)
-        {
+    pub async fn get(&self, language: &str) -> usize {
+        let pos = {
+            let tags = self.tags.borrow();
+            tags.iter()
+                .position(|known_language| known_language == language)
+        };
+
+        debug!(?pos);
+
+        if let Some(pos) = pos {
             pos
         } else {
-            self.file
-                .write_all(language.as_bytes())
+            let mut file = self.file.lock().await;
+            file.write_all(language.as_bytes())
                 .await
                 .expect("Failed to write to tag file");
-            self.file
-                .write_all("\n".as_bytes())
+            file.write_all("\n".as_bytes())
                 .await
                 .expect("Failed to write to tag file");
 
-            self.tags.push(language.to_owned());
+            let mut tags = self.tags.borrow_mut();
 
-            self.tags.len() - 1
+            tags.push(language.to_owned());
+
+            tags.len() - 1
         }
     }
 }

@@ -30,13 +30,7 @@ function M.setup(opts)
 	}, {
 		group = M.autogroup_id,
 		callback = function()
-			M.active = true
-
-			if not M.active_timer:is_active() then
-				M.active_timer:start(0, 30 * 1000, function()
-					M.handle_timer()
-				end)
-			end
+			M.trigger_heartbeat()
 		end,
 	})
 	M.leave_autocmd_id = vim.api.nvim_create_autocmd({
@@ -45,10 +39,7 @@ function M.setup(opts)
 	}, {
 		group = M.autogroup_id,
 		callback = function()
-			M.active = false
-			M.active_timer:start(20 * 1000, 0, function()
-				M.handle_timer()
-			end)
+			M.trigger_exit()
 		end,
 	})
 end
@@ -63,23 +54,24 @@ function M.handle_timer()
 	vim.schedule(function()
 		M.trigger_heartbeat()
 	end)
-
-	M.active = false
 end
 
 function M.trigger_heartbeat()
-	vim.schedule(function()
-		local basename = vim.fs.basename(vim.fs.root(0, ".git"))
-		if basename == nil then
-			basename = "unknown"
+	local filetype = vim.bo.filetype
+	if vim.bo.buftype ~= "" then
+		filetype = ""
+	end
+
+	local basename = vim.fs.basename(vim.fs.root(0, ".git"))
+	if basename == nil then
+		basename = "unknown"
+	end
+	M.socket:write(filetype .. "\30" .. basename .. "\n", function(err)
+		if not err == nil then
+			vim.schedule(function()
+				vim.notify("Failed to write to code statistics socket: " .. err, vim.log.levels.ERROR)
+			end)
 		end
-		M.socket:write(vim.bo.filetype .. "\30" .. basename .. "\n", function(err)
-			if not err == nil then
-				vim.schedule(function()
-					vim.notify("Failed to write to code statistics socket: " .. err, vim.log.levels.ERROR)
-				end)
-			end
-		end)
 	end)
 end
 

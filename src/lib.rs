@@ -1,9 +1,18 @@
-#![feature(c_size_t)]
+#![feature(c_size_t, local_waker)]
 
 use core::ffi::{c_char, c_int, c_size_t};
+use std::{
+    cell::RefCell,
+    future::poll_fn,
+    pin::Pin,
+    rc::{Rc, Weak},
+    task::{Context, LocalWaker, Poll},
+};
+
+use smol::stream::Stream;
 
 pub mod config;
-pub mod heartbeat;
+pub mod debounce;
 pub mod log;
 pub mod tags;
 
@@ -45,4 +54,90 @@ extern "C" {
         path: *const c_char,
         length: c_size_t,
     ) -> c_int;
+}
+
+struct ChannelState<T, const S: usize> {
+    data: [Option<T>; S],
+    read_idx: usize,
+    write_idx: usize,
+    waker: Option<LocalWaker>,
+}
+
+pub struct Receiver<T, const S: usize> {
+    state: Rc<RefCell<ChannelState<T, S>>>,
+}
+
+impl<T, const S: usize> Receiver<T, S> {
+    fn poll_next_inner(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        if Rc::weak_count(&self.state) == 0 {
+            return Poll::Ready(None);
+        }
+        let mut state = self.state.borrow_mut();
+
+        if state.read_idx != state.write_idx {
+            let idx = state.read_idx;
+            let item = state.data[idx].take();
+            state.read_idx += 1;
+            state.read_idx %= S;
+            Poll::Ready(Some(item.unwrap()))
+        } else {
+            state.waker = Some(cx.local_waker().to_owned());
+            Poll::Pending
+        }
+    }
+
+    pub async fn recv(&self) -> Option<T> {
+        poll_fn(|cx| self.poll_next_inner(cx)).await
+    }
+}
+
+impl<T, const S: usize> Stream for Receiver<T, S> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::into_inner(self).poll_next_inner(cx)
+    }
+}
+
+pub struct Sender<T, const S: usize> {
+    state: Weak<RefCell<ChannelState<T, S>>>,
+}
+
+impl<T, const S: usize> Clone for Sender<T, S> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl<T, const S: usize> Sender<T, S> {
+    pub fn send(&self, value: T) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut state = state.borrow_mut();
+        let idx = state.write_idx;
+        state.data[idx] = Some(value);
+        state.write_idx += 1;
+        state.write_idx %= S;
+        let Some(waker) = state.waker.take() else {
+            return;
+        };
+        drop(state);
+        waker.wake();
+    }
+}
+
+pub fn channel<T, const S: usize>() -> (Sender<T, S>, Receiver<T, S>) {
+    let state = Rc::new(RefCell::new(ChannelState {
+        data: [const { None }; S],
+        read_idx: 0,
+        write_idx: 0,
+        waker: None,
+    }));
+
+    let weak_state = Rc::downgrade(&state);
+
+    (Sender { state: weak_state }, Receiver { state })
 }
