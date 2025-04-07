@@ -56,6 +56,10 @@ async fn send_start_event(
     file.write_all(&timestamp.timestamp().to_ne_bytes())
         .await
         .expect("Failed to write to log file");
+
+    file.seek(SeekFrom::End(-(size_of::<i64>() as i64 + 1)))
+        .await
+        .expect("Failed to write to log file");
 }
 
 async fn send_stop_event(file: &mut File, timestamp: DateTime<Utc>) {
