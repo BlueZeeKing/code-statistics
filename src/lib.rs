@@ -14,6 +14,7 @@ use smol::stream::Stream;
 pub mod config;
 pub mod debounce;
 pub mod log;
+pub mod manager;
 pub mod tags;
 
 pub const SD_LISTEN_FDS_START: i32 = 3;

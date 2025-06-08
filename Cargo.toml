@@ -13,6 +13,7 @@ smol = "2.0.2"
 toml = "0.8.19"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+zbus = "5.7.1"
 
 [workspace]
 members = ["utils"]

@@ -11,7 +11,9 @@ use std::{
 use chrono::Utc;
 use code_statistics::{
     config::{read_config, Config},
-    log::{log, LogMessage},
+    debounce::LogMessage,
+    log::log,
+    manager::ManagerProxy,
     sd_is_socket_unix, sd_listen_fds,
     tags::Tags,
     SD_LISTEN_FDS_START,
@@ -25,8 +27,9 @@ use smol::{
     stream::StreamExt,
     unblock, Timer,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, span, trace, warn, Instrument, Level};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use zbus::Connection;
 
 fn main() -> Result<(), ()> {
     tracing_subscriber::registry()
@@ -50,7 +53,7 @@ fn main() -> Result<(), ()> {
 
         debug!(?config);
 
-        let log = log(&executor, config);
+        let (log, log_system_channel) = log(&executor, config);
 
         let languages = Rc::new(Tags::new("languages").await);
         let projects = Rc::new(Tags::new("projects").await);
@@ -79,6 +82,71 @@ fn main() -> Result<(), ()> {
 
         let ids = Rc::new(Cell::new(0));
 
+        executor
+            .spawn(
+                async move {
+                    let connection = Connection::system()
+                        .await
+                        .expect("Failed to connect to dbus");
+                    let proxy = ManagerProxy::new(&connection)
+                        .await
+                        .expect("Failed to connect to logind");
+
+                    let mut stream = proxy
+                        .receive_prepare_for_sleep()
+                        .await
+                        .expect("Failed to get sleep signals");
+
+                    let mut inhibit_fd = Some(
+                        proxy
+                            .inhibit(
+                                "sleep",
+                                "code-statistics",
+                                "Logging end of activity",
+                                "delay",
+                            )
+                            .await
+                            .expect("Failed to inhibit sleep"),
+                    );
+
+                    trace!("finished setting up");
+
+                    while let Some(is_sleeping) = stream.next().await {
+                        let args = is_sleeping
+                            .args()
+                            .expect("Failed to parse prepare for sleep args");
+
+                        trace!(name = "received sleep signal", ?args);
+
+                        if !args.start {
+                            log_system_channel.send(code_statistics::log::SystemMessage::Resume);
+
+                            inhibit_fd = Some(
+                                proxy
+                                    .inhibit(
+                                        "sleep",
+                                        "code-statistics",
+                                        "Logging end of activity",
+                                        "delay",
+                                    )
+                                    .await
+                                    .expect("Failed to inhibit sleep"),
+                            );
+                        } else {
+                            log_system_channel.send(code_statistics::log::SystemMessage::Suspend {
+                                time: Utc::now(),
+                            });
+
+                            if let Some(fd) = inhibit_fd.take() {
+                                drop(fd);
+                            }
+                        }
+                    }
+                }
+                .instrument(span!(Level::DEBUG, "suspend task")),
+            )
+            .detach();
+
         while let Some(stream) = listener.next().await {
             let stream = stream.expect("Failed to get next connection");
             let mut buffered_stream = BufReader::new(stream);
@@ -90,92 +158,90 @@ fn main() -> Result<(), ()> {
             let id = ids.get();
             ids.set(id + 1);
 
-            info!("Client joined with id {}", id);
-
             executor
-                .spawn(async move {
-                    let mut last_message = None;
+                .spawn(
+                    async move {
+                        let mut active = false;
 
-                    loop {
-                        let Ok(line): Result<String, std::io::Error> = (
-                            async {
-                                let mut line = String::new();
-                                let amount_read = buffered_stream.read_line(&mut line).await?;
-                                if amount_read == 0 {
-                                    Err(std::io::Error::new(
-                                        ErrorKind::NotConnected,
-                                        "Client no longer connected",
-                                    ))
-                                } else {
-                                    Ok(line)
+                        info!("joined");
+
+                        loop {
+                            let Ok(line): Result<String, std::io::Error> = (
+                                async {
+                                    let mut line = String::new();
+                                    let amount_read = buffered_stream.read_line(&mut line).await?;
+                                    trace!("sent data");
+                                    if amount_read == 0 {
+                                        Err(std::io::Error::new(
+                                            ErrorKind::NotConnected,
+                                            "Client no longer connected",
+                                        ))
+                                    } else {
+                                        Ok(line)
+                                    }
+                                },
+                                async {
+                                    if active {
+                                        poll_fn(|_| Poll::<()>::Pending).await;
+                                    } else {
+                                        Timer::after(config.timeout).await;
+                                    }
+                                    trace!("timeout reached");
+                                    Ok("".to_string())
+                                },
+                            )
+                                .race()
+                                .await
+                            else {
+                                debug!("disconnected");
+                                log.send(LogMessage::End {
+                                    id,
+                                    time: Utc::now(),
+                                });
+                                break;
+                            };
+
+                            if line.trim().is_empty() {
+                                debug!("received end message");
+                                log.send(LogMessage::End {
+                                    id,
+                                    time: Utc::now(),
+                                });
+                                active = false;
+                            } else {
+                                let line = line.trim();
+
+                                let (language, project) =
+                                    line.split_once(30u8 as char).unwrap_or((line, "unknown"));
+
+                                debug!(event = "received start", language, project);
+
+                                if config.ignored_languages.contains(language) {
+                                    trace!("skipping ignored language");
+                                    continue;
                                 }
-                            },
-                            async {
-                                if last_message.is_none() {
-                                    poll_fn(|_| Poll::<()>::Pending).await;
-                                } else {
-                                    Timer::after(config.timeout).await;
+
+                                if language.is_empty() {
+                                    trace!("ignoring empty language");
+                                    continue;
                                 }
-                                Ok("".to_string())
-                            },
-                        )
-                            .race()
-                            .await
-                        else {
-                            debug!("Client disconnected");
-                            log.send(LogMessage::End {
-                                id,
-                                time: Utc::now(),
-                            });
-                            break;
-                        };
 
-                        if line.trim().is_empty() {
-                            debug!("Received end");
-                            log.send(LogMessage::End {
-                                id,
-                                time: Utc::now(),
-                            });
-                            last_message = None;
-                        } else {
-                            let line = line.trim();
+                                let language = languages.get(language).await;
+                                let project = projects.get(project).await;
 
-                            debug!("Received line: {}", line);
+                                active = true;
 
-                            let (language, project) =
-                                line.split_once(30u8 as char).unwrap_or((line, "unknown"));
-
-                            debug!(language, project);
-
-                            if config.ignored_languages.contains(language) {
-                                trace!("skipping ignored language");
-                                continue;
+                                log.send(LogMessage::Start {
+                                    id,
+                                    time: Utc::now(),
+                                    language,
+                                    project,
+                                });
                             }
-
-                            if language.is_empty() {
-                                trace!("ignoring empty language");
-                                continue;
-                            }
-
-                            let language = languages.get(language).await;
-                            let project = projects.get(project).await;
-
-                            if last_message == Some((language, project)) {
-                                trace!("Skipping sending same language and project");
-                                continue;
-                            }
-
-                            last_message = Some((language, project));
-
-                            log.send(LogMessage::Start {
-                                id,
-                                time: Utc::now(),
-                                language,
-                                project,
-                            });
                         }
                     }
-                })
+                    .instrument(span!(Level::DEBUG, "client", id)),
+                )
                 .detach();
         }
     }));
